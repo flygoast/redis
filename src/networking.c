@@ -58,7 +58,9 @@ redisClient *createClient(int fd) {
      * contexts (for instance a Lua script) we need a non connected client. */
     if (fd != -1) {
         anetNonBlock(NULL,fd);
-        anetTcpNoDelay(NULL,fd);
+        anetEnableTcpNoDelay(NULL,fd);
+        if (server.tcpkeepalive)
+            anetKeepAlive(NULL,fd,server.tcpkeepalive);
         if (aeCreateFileEvent(server.el,fd,AE_READABLE,
             readQueryFromClient, c) == AE_ERR)
         {
@@ -85,6 +87,9 @@ redisClient *createClient(int fd) {
     c->ctime = c->lastinteraction = server.unixtime;
     c->authenticated = 0;
     c->replstate = REDIS_REPL_NONE;
+    c->reploff = 0;
+    c->repl_ack_off = 0;
+    c->repl_ack_time = 0;
     c->slave_listening_port = 0;
     c->reply = listCreate();
     c->reply_bytes = 0;
@@ -113,15 +118,17 @@ redisClient *createClient(int fd) {
  * returns REDIS_OK, and make sure to install the write handler in our event
  * loop so that when the socket is writable new data gets written.
  *
- * If the client should not receive new data, because it is a fake client
- * or a slave, or because the setup of the write handler failed, the function
- * returns REDIS_ERR.
+ * If the client should not receive new data, because it is a fake client,
+ * a master, a slave not yet online, or because the setup of the write handler
+ * failed, the function returns REDIS_ERR.
  *
  * Typically gets called every time a reply is built, before adding more
  * data to the clients output buffers. If the function returns REDIS_ERR no
  * data should be appended to the output buffers. */
 int prepareClientToWrite(redisClient *c) {
     if (c->flags & REDIS_LUA_CLIENT) return REDIS_OK;
+    if ((c->flags & REDIS_MASTER) &&
+        !(c->flags & REDIS_MASTER_FORCE_REPLY)) return REDIS_ERR;
     if (c->fd <= 0) return REDIS_ERR; /* Fake client */
     if (c->bufpos == 0 && listLength(c->reply) == 0 &&
         (c->replstate == REDIS_REPL_NONE ||
@@ -593,11 +600,41 @@ void disconnectSlaves(void) {
     }
 }
 
+/* This function is called when the slave lose the connection with the
+ * master into an unexpected way. */
+void replicationHandleMasterDisconnection(void) {
+    server.master = NULL;
+    server.repl_state = REDIS_REPL_CONNECT;
+    server.repl_down_since = server.unixtime;
+    /* We lost connection with our master, force our slaves to resync
+     * with us as well to load the new data set.
+     *
+     * If server.masterhost is NULL the user called SLAVEOF NO ONE so
+     * slave resync is not needed. */
+    if (server.masterhost != NULL) disconnectSlaves();
+}
+
 void freeClient(redisClient *c) {
     listNode *ln;
 
     /* If this is marked as current client unset it */
     if (server.current_client == c) server.current_client = NULL;
+
+    /* If it is our master that's beging disconnected we should make sure
+     * to cache the state to try a partial resynchronization later.
+     *
+     * Note that before doing this we make sure that the client is not in
+     * some unexpected state, by checking its flags. */
+    if (server.master &&
+         (c->flags & REDIS_MASTER) &&
+        !(c->flags & (REDIS_CLOSE_AFTER_REPLY|
+                     REDIS_CLOSE_ASAP|
+                     REDIS_BLOCKED|
+                     REDIS_UNBLOCKED)))
+    {
+        replicationCacheMaster(c);
+        return;
+    }
 
     /* Note that if the client we are freeing is blocked into a blocking
      * call, we have to set querybuf to NULL *before* to call
@@ -618,16 +655,21 @@ void freeClient(redisClient *c) {
     pubsubUnsubscribeAllPatterns(c,0);
     dictRelease(c->pubsub_channels);
     listRelease(c->pubsub_patterns);
-    /* Obvious cleanup */
-    aeDeleteFileEvent(server.el,c->fd,AE_READABLE);
-    aeDeleteFileEvent(server.el,c->fd,AE_WRITABLE);
+    /* Close socket, unregister events, and remove list of replies and
+     * accumulated arguments. */
+    if (c->fd != -1) {
+        aeDeleteFileEvent(server.el,c->fd,AE_READABLE);
+        aeDeleteFileEvent(server.el,c->fd,AE_WRITABLE);
+        close(c->fd);
+    }
     listRelease(c->reply);
     freeClientArgv(c);
-    close(c->fd);
     /* Remove from the list of clients */
-    ln = listSearchKey(server.clients,c);
-    redisAssert(ln != NULL);
-    listDelNode(server.clients,ln);
+    if (c->fd != -1) {
+        ln = listSearchKey(server.clients,c);
+        redisAssert(ln != NULL);
+        listDelNode(server.clients,ln);
+    }
     /* When client was just unblocked because of a blocking operation,
      * remove it from the list with unblocked clients. */
     if (c->flags & REDIS_UNBLOCKED) {
@@ -645,20 +687,16 @@ void freeClient(redisClient *c) {
         ln = listSearchKey(l,c);
         redisAssert(ln != NULL);
         listDelNode(l,ln);
+        /* We need to remember the time when we started to have zero
+         * attached slaves, as after some time we'll free the replication
+         * backlog. */
+        if (c->flags & REDIS_SLAVE && listLength(server.slaves) == 0)
+            server.repl_no_slaves_since = server.unixtime;
+        refreshGoodSlavesCount();
     }
 
     /* Case 2: we lost the connection with the master. */
-    if (c->flags & REDIS_MASTER) {
-        server.master = NULL;
-        server.repl_state = REDIS_REPL_CONNECT;
-        server.repl_down_since = server.unixtime;
-        /* We lost connection with our master, force our slaves to resync
-         * with us as well to load the new data set.
-         *
-         * If server.masterhost is NULL the user called SLAVEOF NO ONE so
-         * slave resync is not needed. */
-        if (server.masterhost != NULL) disconnectSlaves();
-    }
+    if (c->flags & REDIS_MASTER) replicationHandleMasterDisconnection();
 
     /* If this client was scheduled for async freeing we need to remove it
      * from the queue. */
@@ -706,13 +744,8 @@ void sendReplyToClient(aeEventLoop *el, int fd, void *privdata, int mask) {
 
     while(c->bufpos > 0 || listLength(c->reply)) {
         if (c->bufpos > 0) {
-            if (c->flags & REDIS_MASTER) {
-                /* Don't reply to a master */
-                nwritten = c->bufpos - c->sentlen;
-            } else {
-                nwritten = write(fd,c->buf+c->sentlen,c->bufpos-c->sentlen);
-                if (nwritten <= 0) break;
-            }
+            nwritten = write(fd,c->buf+c->sentlen,c->bufpos-c->sentlen);
+            if (nwritten <= 0) break;
             c->sentlen += nwritten;
             totwritten += nwritten;
 
@@ -732,13 +765,8 @@ void sendReplyToClient(aeEventLoop *el, int fd, void *privdata, int mask) {
                 continue;
             }
 
-            if (c->flags & REDIS_MASTER) {
-                /* Don't reply to a master */
-                nwritten = objlen - c->sentlen;
-            } else {
-                nwritten = write(fd, ((char*)o->ptr)+c->sentlen,objlen-c->sentlen);
-                if (nwritten <= 0) break;
-            }
+            nwritten = write(fd, ((char*)o->ptr)+c->sentlen,objlen-c->sentlen);
+            if (nwritten <= 0) break;
             c->sentlen += nwritten;
             totwritten += nwritten;
 
@@ -783,12 +811,16 @@ void sendReplyToClient(aeEventLoop *el, int fd, void *privdata, int mask) {
 
 /* resetClient prepare the client to process the next command */
 void resetClient(redisClient *c) {
+    redisCommandProc *prevcmd = c->cmd ? c->cmd->proc : NULL;
+
     freeClientArgv(c);
     c->reqtype = 0;
     c->multibulklen = 0;
     c->bulklen = -1;
-    /* We clear the ASKING flag as well if we are not inside a MULTI. */
-    if (!(c->flags & REDIS_MULTI)) c->flags &= (~REDIS_ASKING);
+    /* We clear the ASKING flag as well if we are not inside a MULTI, and
+     * if what we just executed is not the ASKING command itself. */
+    if (!(c->flags & REDIS_MULTI) && prevcmd != askingCommand)
+        c->flags &= (~REDIS_ASKING);
 }
 
 int processInlineBuffer(redisClient *c) {
@@ -1057,6 +1089,7 @@ void readQueryFromClient(aeEventLoop *el, int fd, void *privdata, int mask) {
     if (nread) {
         sdsIncrLen(c->querybuf,nread);
         c->lastinteraction = server.unixtime;
+        if (c->flags & REDIS_MASTER) c->reploff += nread;
     } else {
         server.current_client = NULL;
         return;
@@ -1257,7 +1290,7 @@ void rewriteClientCommandVector(redisClient *c, int argc, ...) {
     /* Replace argv and argc with our new versions. */
     c->argv = argv;
     c->argc = argc;
-    c->cmd = lookupCommand(c->argv[0]->ptr);
+    c->cmd = lookupCommandOrOriginal(c->argv[0]->ptr);
     redisAssertWithInfo(c,NULL,c->cmd != NULL);
     va_end(ap);
 }
@@ -1275,7 +1308,7 @@ void rewriteClientCommandArgument(redisClient *c, int i, robj *newval) {
 
     /* If this is the command name make sure to fix c->cmd. */
     if (i == 0) {
-        c->cmd = lookupCommand(c->argv[0]->ptr);
+        c->cmd = lookupCommandOrOriginal(c->argv[0]->ptr);
         redisAssertWithInfo(c,NULL,c->cmd != NULL);
     }
 }
